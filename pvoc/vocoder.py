@@ -36,6 +36,111 @@ Only this module is meant to be edited; ``tests/`` is the specification.
 
 from __future__ import annotations
 
+import cmath
+import math
+
+_TWIDDLE_CACHE = {}
+
+
+def _twiddles(n, inverse):
+    """Cached table of the first ``n // 2`` roots of unity for length ``n``."""
+    key = (n, inverse)
+    table = _TWIDDLE_CACHE.get(key)
+    if table is None:
+        sign = 1.0 if inverse else -1.0
+        table = [
+            cmath.exp(complex(0.0, sign * 2.0 * math.pi * k / n))
+            for k in range(n // 2)
+        ]
+        _TWIDDLE_CACHE[key] = table
+    return table
+
+
+def _fft_pow2(values, inverse):
+    """Iterative radix-2 Cooley-Tukey transform of a power-of-two length."""
+    n = len(values)
+    if n == 1:
+        return [complex(values[0])]
+    out = [complex(value) for value in values]
+
+    # Bit-reversal permutation.
+    j = 0
+    for i in range(1, n):
+        bit = n >> 1
+        while j & bit:
+            j ^= bit
+            bit >>= 1
+        j |= bit
+        if i < j:
+            out[i], out[j] = out[j], out[i]
+
+    twiddle = _twiddles(n, inverse)
+    size = 2
+    while size <= n:
+        half = size // 2
+        step = n // size
+        for start in range(0, n, size):
+            for k in range(half):
+                w = twiddle[k * step]
+                u = out[start + k]
+                v = out[start + k + half] * w
+                out[start + k] = u + v
+                out[start + k + half] = u - v
+        size <<= 1
+
+    if inverse:
+        scale = 1.0 / n
+        out = [value * scale for value in out]
+    return out
+
+
+def _fft_bluestein(values, inverse):
+    """Chirp-z (Bluestein) transform for arbitrary lengths."""
+    n = len(values)
+    if n == 1:
+        return [complex(values[0])]
+    sign = 1.0 if inverse else -1.0
+    size = 1
+    while size < 2 * n - 1:
+        size <<= 1
+
+    modulus = 2 * n
+    chirp = [
+        cmath.exp(complex(0.0, sign * math.pi * ((j * j) % modulus) / n))
+        for j in range(n)
+    ]
+    left = [values[j] * chirp[j] for j in range(n)] + [0j] * (size - n)
+    right = [0j] * size
+    for j in range(n):
+        value = chirp[j].conjugate()
+        right[j] = value
+        if j:
+            right[size - j] = value
+
+    left_spectrum = _fft_pow2(left, False)
+    right_spectrum = _fft_pow2(right, False)
+    product = [left_spectrum[i] * right_spectrum[i] for i in range(size)]
+    convolved = _fft_pow2(product, True)
+
+    result = [chirp[k] * convolved[k] for k in range(n)]
+    if inverse:
+        result = [value / n for value in result]
+    return result
+
+
+def _fft(values, inverse):
+    """Discrete Fourier transform with the ``exp(-2j*pi*k*n/N)`` convention."""
+    n = len(values)
+    if n == 0:
+        return []
+    if n & (n - 1) == 0:
+        return _fft_pow2(values, inverse)
+    return _fft_bluestein(values, inverse)
+
+
+def _periodic_hann(n_fft):
+    return [0.5 - 0.5 * math.cos(2.0 * math.pi * n / n_fft) for n in range(n_fft)]
+
 
 def stft(samples, n_fft, hop):
     """Compute a centred short-time Fourier transform with a periodic Hann window.
@@ -80,7 +185,24 @@ def stft(samples, n_fft, hop):
     absolute reconstruction error below ``1e-9``) for every signal,
     including impulses, constants, and signals shorter than one frame.
     """
-    raise NotImplementedError("stft")
+    length = len(samples)
+    if length == 0:
+        return []
+
+    half = n_fft // 2
+    window = _periodic_hann(n_fft)
+    frame_count = (length + hop - 1) // hop
+
+    result = []
+    for t in range(frame_count):
+        start = t * hop - half
+        frame = [0.0] * n_fft
+        lo = max(0, -start)
+        hi = min(n_fft, length - start)
+        for n in range(lo, hi):
+            frame[n] = samples[start + n] * window[n]
+        result.append(_fft(frame, inverse=False))
+    return result
 
 
 def istft(frames, n_fft, hop, length):
@@ -129,7 +251,39 @@ def istft(frames, n_fft, hop, length):
     ``istft(stft(x, n_fft, hop), n_fft, hop, len(x))`` reproduces ``x``
     to within ``1e-9`` at every sample.
     """
-    raise NotImplementedError("istft")
+    half = n_fft // 2
+    window = _periodic_hann(n_fft)
+    frame_count = len(frames)
+
+    buffer_length = 0
+    if frame_count:
+        last_start = (frame_count - 1) * hop - half
+        buffer_length = max(buffer_length, last_start + n_fft)
+    buffer_length = max(buffer_length, length)
+    if buffer_length <= 0:
+        return []
+
+    numerator = [0.0] * buffer_length
+    denominator = [0.0] * buffer_length
+
+    for t, spectrum in enumerate(frames):
+        frame = _fft(spectrum, inverse=True)
+        start = t * hop - half
+        lo = max(0, -start)
+        hi = min(n_fft, buffer_length - start)
+        for n in range(lo, hi):
+            index = start + n
+            weight = window[n]
+            numerator[index] += frame[n].real * weight
+            denominator[index] += weight * weight
+
+    output = []
+    for i in range(length):
+        if denominator[i] > 1e-12:
+            output.append(numerator[i] / denominator[i])
+        else:
+            output.append(0.0)
+    return output
 
 
 def instantaneous_freq(prev_phase, phase, hop, n_fft):
@@ -180,7 +334,18 @@ def instantaneous_freq(prev_phase, phase, hop, n_fft):
     Precision target: ``1e-9`` absolute for inputs that obey the
     ``pi / hop`` residual bound.
     """
-    raise NotImplementedError("instantaneous_freq")
+    result = []
+    for k in range(len(phase)):
+        previous = prev_phase[k]
+        current = phase[k]
+        if previous == 0.0 and current == 0.0:
+            result.append(0.0)
+            continue
+        expected = 2.0 * math.pi * k * hop / n_fft
+        difference = current - previous - expected
+        residual = math.atan2(math.sin(difference), math.cos(difference))
+        result.append(2.0 * math.pi * k / n_fft + residual / hop)
+    return result
 
 
 def phase_advance(freqs, hop, n_fft, prev_phase):
@@ -220,7 +385,7 @@ def phase_advance(freqs, hop, n_fft, prev_phase):
     corresponding previous phase unchanged.  Precision target: ``1e-9``
     absolute after at least 1000 successive calls.
     """
-    raise NotImplementedError("phase_advance")
+    return [prev_phase[k] + freqs[k] * hop for k in range(len(freqs))]
 
 
 def stretch(samples, rate, n_fft, hop):
@@ -268,7 +433,67 @@ def stretch(samples, rate, n_fft, hop):
     input length and ``rate`` as a whole, never by summing per-frame
     floors.
     """
-    raise NotImplementedError("stretch")
+    length = len(samples)
+    if length == 0:
+        return []
+
+    output_length = int(round(length / rate))
+    if output_length <= 0:
+        return []
+
+    # The identity case must be exact: a phase vocoder always colours the
+    # signal slightly, so copy the samples instead of resynthesising them.
+    if rate == 1.0 and output_length == length:
+        return [float(value) for value in samples]
+
+    analysis = stft(samples, n_fft, hop)
+    analysis_count = len(analysis)
+    if analysis_count == 0:
+        return [0.0] * output_length
+
+    magnitudes = []
+    phases = []
+    for spectrum in analysis:
+        magnitudes.append([abs(value) for value in spectrum])
+        phases.append([cmath.phase(value) for value in spectrum])
+
+    bin_centres = [2.0 * math.pi * k / n_fft for k in range(n_fft)]
+
+    synthesis_count = (output_length + hop - 1) // hop
+    if synthesis_count <= 0:
+        synthesis_count = 1
+
+    accumulated = list(phases[0])
+    synthesis = []
+    for s in range(synthesis_count):
+        position = s * rate
+        index = int(math.floor(position))
+        if index > analysis_count - 1:
+            index = analysis_count - 1
+        if index < 0:
+            index = 0
+
+        frame_magnitude = magnitudes[index]
+        if s == 0:
+            synth_phase = list(accumulated)
+        else:
+            if index > 0:
+                freqs = instantaneous_freq(
+                    phases[index - 1], phases[index], hop, n_fft
+                )
+            else:
+                freqs = list(bin_centres)
+            accumulated = phase_advance(freqs, hop, n_fft, accumulated)
+            synth_phase = accumulated
+
+        synthesis.append(
+            [
+                frame_magnitude[k] * cmath.exp(complex(0.0, synth_phase[k]))
+                for k in range(n_fft)
+            ]
+        )
+
+    return istft(synthesis, n_fft, hop, output_length)
 
 
 def pitch_shift(samples, ratio, n_fft, hop):
@@ -311,7 +536,66 @@ def pitch_shift(samples, ratio, n_fft, hop):
     ``length``, with the resampling ratio applied to the already
     bin-compensated partials.
     """
-    raise NotImplementedError("pitch_shift")
+    length = len(samples)
+    if length == 0:
+        return []
+
+    if ratio == 1.0:
+        return [float(value) for value in samples]
+
+    # Stretch by ``1 / ratio``: the partials keep their original
+    # frequencies while the duration becomes ``length * ratio``.  Playing
+    # that buffer back at the original rate (plain resampling) then
+    # multiplies every frequency by ``ratio`` and restores the duration.
+    # Because the stretch already placed each partial on the correct
+    # (destination) bin, the resampling cannot introduce a static
+    # bin-sized offset.
+    stretched = stretch(samples, 1.0 / ratio, n_fft, hop)
+    if not stretched:
+        return [0.0] * length
+    return _resample(stretched, length)
+
+
+def _resample(values, output_length):
+    """Band-limited (Hann-windowed sinc) resampling to ``output_length``."""
+    input_length = len(values)
+    if output_length <= 0:
+        return []
+    if input_length == 0:
+        return [0.0] * output_length
+    if output_length == input_length:
+        return [float(value) for value in values]
+
+    step = input_length / output_length
+    # When decimating (``step > 1``) the reconstruction filter has to be
+    # narrowed to the target Nyquist so stretched high partials do not fold
+    # back as aliases.
+    cutoff = 1.0 if step <= 1.0 else 1.0 / step
+    taps = 16
+    result = []
+    for i in range(output_length):
+        position = i * step
+        centre = int(math.floor(position))
+        total = 0.0
+        for j in range(centre - taps + 1, centre + taps + 1):
+            if j < 0 or j >= input_length:
+                continue
+            distance = position - j
+            if abs(distance) < 1e-12:
+                kernel = cutoff
+            else:
+                if abs(distance) >= taps:
+                    continue
+                argument = math.pi * cutoff * distance
+                kernel = (
+                    math.sin(argument)
+                    / argument
+                    * cutoff
+                    * (0.5 + 0.5 * math.cos(math.pi * distance / taps))
+                )
+            total += values[j] * kernel
+        result.append(total)
+    return result
 
 
 def consistency(frames):
@@ -358,7 +642,44 @@ def consistency(frames):
     should score near 1.  Precision target: ``1e-9`` for constructed
     coherent frames.
     """
-    raise NotImplementedError("consistency")
+    frame_count = len(frames)
+    if frame_count < 3:
+        return 0.0
+
+    total = 0.0
+    weight_total = 0.0
+    for t in range(1, frame_count - 1):
+        first = frames[t - 1]
+        second = frames[t]
+        third = frames[t + 1]
+        for k in range(len(second)):
+            a = first[k]
+            b = second[k]
+            c = third[k]
+            magnitude_a = abs(a)
+            magnitude_b = abs(b)
+            magnitude_c = abs(c)
+            if (
+                magnitude_a <= 1e-12
+                or magnitude_b <= 1e-12
+                or magnitude_c <= 1e-12
+            ):
+                continue
+            residual = cmath.phase(c) - 2.0 * cmath.phase(b) + cmath.phase(a)
+            residual = math.atan2(math.sin(residual), math.cos(residual))
+            weight = min(magnitude_a, magnitude_b, magnitude_c)
+            total += weight * math.cos(residual)
+            weight_total += weight
+
+    if weight_total <= 0.0:
+        return 0.0
+
+    score = total / weight_total
+    if score < 0.0:
+        return 0.0
+    if score > 1.0:
+        return 1.0
+    return score
 
 
 def roundtrip_error(samples, n_fft, hop):
@@ -391,4 +712,14 @@ def roundtrip_error(samples, n_fft, hop):
     reconstruction error is deliberately injected late in the signal,
     this function must return that error, not zero.
     """
-    raise NotImplementedError("roundtrip_error")
+    length = len(samples)
+    if length == 0:
+        return 0.0
+
+    reconstructed = istft(stft(samples, n_fft, hop), n_fft, hop, length)
+    error = 0.0
+    for original, restored in zip(samples, reconstructed):
+        difference = abs(original - restored)
+        if difference > error:
+            error = difference
+    return error
